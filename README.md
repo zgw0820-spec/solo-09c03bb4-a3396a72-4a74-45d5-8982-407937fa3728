@@ -4,7 +4,9 @@ After a BGP neighbour reconnects, the on-call engineer needs to know whether the
 affected networks have already moved to the backup path. This FastAPI service
 receives the reconnects, IPv4 announcements, withdrawals and End-of-RIB messages
 relayed by the collector, keeps one shared routing table, and answers
-longest-prefix lookups with next hop and a confirmed/pending flag.
+longest-prefix lookups with next hop and a confirmed/pending flag. It also keeps
+a bounded history of routing changes and attributes batches of traffic records
+to the neighbour that actually carried them across each time interval.
 
 ## Delivery semantics
 
@@ -37,6 +39,51 @@ shared table revision, then the winner is chosen by:
 
 Destinations with no route are returned explicitly with `status: "not_found"`.
 
+## Routing history and batch traffic attribution
+
+Before a leased-line expansion, the on-call engineer estimates how much
+traffic each neighbour carries by replaying the BGP selection history.
+`POST /v1/attribution/report` takes a batch of traffic records — each with a
+destination IPv4, a UTC interval and a byte count — and attributes every
+record against the retained routing history.
+
+### History retention
+
+* The service keeps **at most the last 10 minutes** of history in memory
+  (`HISTORY_RETENTION_SECONDS`, default `600`). Pruning runs on every
+  mutation; the entry effective at the window start is retained, so a route
+  still in effect when the window began can always be reconstructed.
+* Only prefix/neighbour pairs whose effective route state **actually changes**
+  get an archive entry: announcements, withdrawals, the
+  confirmed→pending flip on a reconnect and batch purges. Identical
+  re-announcements are deduplicated.
+* **End-of-RIB and grace-expiry cleanup remove the whole batch at one
+  effective instant**, so the batch withdrawal is visible atomically in the
+  history as well.
+* `POST /v1/admin/reset` clears the archives too; history is then recorded
+  afresh from the next update.
+
+### Attribution rules
+
+* Intervals are **half-open: `start` inclusive, `end` exclusive**.
+* The same selection rules as `/v1/lookup` are applied to the reconstructed
+  table (longest prefix, confirmed before pending, neighbour priority,
+  deterministic tie-break).
+* A record counts toward a neighbour's byte total **only when that same
+  neighbour is selected for the entire interval**.
+* Every other record is listed individually with one of these outcomes:
+  * `no_route` — no route covered the destination at any point of the
+    interval;
+  * `changed_route` — the selected neighbour changed inside the interval.
+    Moving away and later coming back is still a change; `first_change_at`
+    gives the first instant the selection changed;
+  * `insufficient_history` — the retained 10-minute window does not cover the
+    whole interval, or an archive needed for the destination starts after
+    the interval start.
+* The whole batch is evaluated against a **frozen snapshot taken when the
+  report starts**. Routing updates received while the report computes keep
+  being applied and never change this report's answers.
+
 ## Run with Docker Compose
 
 ```bash
@@ -58,6 +105,7 @@ Environment variables (see `app/config.py`):
 | `NEIGHBOR_PRIORITIES` | `192.0.2.1=10,192.0.2.2=20` | `ip=priority`, lower wins ties |
 | `DEFAULT_NEIGHBOR_PRIORITY` | `100` | Priority for unlisted neighbours |
 | `RECONNECT_GRACE_SECONDS` | `20` | Default grace window |
+| `HISTORY_RETENTION_SECONDS` | `600` | Routing history retention window (seconds) |
 | `DEMO_SEED` | `1` | Seed the two-neighbour baseline on startup |
 | `HOST_PORT` | `8000` | Host port mapped to container port 8000 |
 
@@ -93,8 +141,29 @@ failover story; `samples/neighbor-backup-192.0.2.2.json` is the standing backup.
 8. **`POST /v1/events`** accepts the whole sample file at once and reports
    per-event outcomes (`applied` / `rejected`); the stale event is reported in
    place without aborting later events.
+9. **`POST /v1/attribution/report`** replays selection history. To see a
+   record that switches neighbour and comes back:
+   1. note the current UTC time, call it `T`;
+   2. **`POST /v1/neighbors/192.0.2.1/reconnect`** with
+      `{"session_id": 2, "grace_seconds": 60}` — the primary's retained
+      routes go pending, so the backup's confirmed `/24` wins the shared
+      prefixes;
+   3. **`POST /v1/neighbors/192.0.2.1/end-of-rib`** with
+      `{"session_id": 2}` — the retained primary routes are batch-purged;
+   4. **`POST /v1/neighbors/192.0.2.1/reconnect`** with
+      `{"session_id": 3, "grace_seconds": 0}` then **announce**
+      `{"prefix": "203.0.113.0/24", "next_hop": "10.0.0.1"}` on session 3 —
+      the primary takes the prefix back;
+   5. in **`POST /v1/attribution/report`**, send one record for
+      `203.0.113.10` spanning the whole sequence (`start` at or before `T`,
+      `end` after the last announcement). It comes back
+      `outcome: "changed_route"` with `first_change_at` set to the first
+      reconnect instant, even though traffic eventually returned to the
+      primary. A record whose interval stays inside one stable segment is
+      `attributed`, and its bytes appear in `neighbor_totals`.
 
-For a clean slate between runs, `POST /v1/admin/reset` clears all state.
+For a clean slate between runs, `POST /v1/admin/reset` clears all state,
+including the routing history.
 
 Replaying both sample files after a reset reconstructs the same end state; this
 is asserted by `tests/test_demo_flow.py`.
@@ -109,6 +178,7 @@ is asserted by `tests/test_demo_flow.py`.
 | POST | `/v1/neighbors/{ip}/end-of-rib` | Batch-remove this neighbour's pending routes |
 | POST | `/v1/events` | Ordered batch with per-event accept/reject |
 | POST | `/v1/lookup` | Batch longest-prefix lookup, one shared revision |
+| POST | `/v1/attribution/report` | Batch traffic attribution from routing history |
 | GET | `/v1/routes` | Table snapshot with pending flags |
 | GET | `/v1/neighbors` | Session state and pending counts per neighbour |
 | POST | `/v1/admin/reset` | Clear state (demo helper) |
@@ -129,7 +199,11 @@ python -m pytest -q
 `httpx` (installed above). The suite covers longest-prefix selection, priority
 tie-breaks, explicit not-found, pending retention, immediate announce/withdraw,
 batch End-of-RIB cleanup, grace expiry, superseded-timer protection, stale/future
-session rejection, per-neighbour independence and sample replay.
+session rejection, per-neighbour independence, sample replay and the attribution
+history: half-open interval boundaries, switch-away-and-back with
+`first_change_at`, no-route and insufficient-history records, change-only
+archiving, 10-minute pruning with window-start reconstruction, batch-purge
+instants, reset behaviour and frozen-snapshot evaluation.
 
 `TestClient` drives the app's real lifespan and event loop, so the grace-timer
 tests exercise the same `asyncio` timer path used in production.

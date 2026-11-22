@@ -19,6 +19,7 @@ def settings() -> Settings:
         neighbor_priorities={PRIMARY: 10, BACKUP: 20},
         default_neighbor_priority=100,
         grace_seconds=30.0,
+        history_retention_seconds=600.0,
         demo_seed=False,
     )
 
@@ -29,6 +30,7 @@ def service(settings: Settings) -> RouteService:
         neighbor_priorities=settings.neighbor_priorities,
         default_neighbor_priority=settings.default_neighbor_priority,
         grace_period_seconds=settings.grace_seconds,
+        history_retention_seconds=settings.history_retention_seconds,
     )
 
 

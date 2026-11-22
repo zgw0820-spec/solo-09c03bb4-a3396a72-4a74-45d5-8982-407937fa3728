@@ -131,6 +131,7 @@ def test_demo_seed_is_swagger_ready(settings):
         neighbor_priorities=settings.neighbor_priorities,
         default_neighbor_priority=100,
         grace_seconds=settings.grace_seconds,
+        history_retention_seconds=settings.history_retention_seconds,
         demo_seed=True,
     )
     service = RouteService(

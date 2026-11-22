@@ -10,6 +10,8 @@ services:
       DEFAULT_NEIGHBOR_PRIORITY: "100"
       # Grace window used when a reconnect does not specify one.
       RECONNECT_GRACE_SECONDS: "20"
+      # Routing history retained for traffic attribution (10 minutes).
+      HISTORY_RETENTION_SECONDS: "600"
       # Seed the two-neighbour baseline at startup so Swagger is demo-ready.
       DEMO_SEED: "1"
     restart: unless-stopped

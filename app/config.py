@@ -69,6 +69,7 @@ class Settings:
     neighbor_priorities: dict[IPv4Address, int]
     default_neighbor_priority: int
     grace_seconds: float
+    history_retention_seconds: float
     demo_seed: bool
 
     @classmethod
@@ -83,5 +84,6 @@ class Settings:
             neighbor_priorities=priorities,
             default_neighbor_priority=_env_int("DEFAULT_NEIGHBOR_PRIORITY", 100),
             grace_seconds=_env_float("RECONNECT_GRACE_SECONDS", 30.0),
+            history_retention_seconds=_env_float("HISTORY_RETENTION_SECONDS", 600.0),
             demo_seed=os.environ.get("DEMO_SEED", "0").lower() in {"1", "true", "yes"},
         )

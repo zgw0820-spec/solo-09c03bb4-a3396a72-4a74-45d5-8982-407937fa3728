@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from ipaddress import IPv4Address, IPv4Network
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class RouteAnnouncement(BaseModel):
@@ -117,6 +117,84 @@ class LookupRequest(BaseModel):
         max_length=10000,
         description="Destination IPv4 addresses. All are resolved against one "
         "shared table revision.",
+    )
+
+
+class AttributionRecordRequest(BaseModel):
+    """One traffic record to attribute against the routing history."""
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "destination": "203.0.113.10",
+                "start": "2026-11-22T10:00:00Z",
+                "end": "2026-11-22T10:05:00Z",
+                "bytes": 1048576,
+            }
+        }
+    )
+
+    destination: IPv4Address = Field(
+        description="Destination IPv4 address whose selected neighbour is traced."
+    )
+    start: datetime = Field(
+        description="UTC interval start, inclusive. Must carry an explicit UTC "
+        "offset (for example ``2026-11-22T10:00:00Z``)."
+    )
+    end: datetime = Field(
+        description="UTC interval end, exclusive. Must be strictly after start."
+    )
+    bytes: int = Field(
+        ge=0,
+        description="Byte count attributed to the winning neighbour only when one "
+        "neighbour is selected across the whole interval.",
+    )
+
+    @field_validator("start", "end")
+    @classmethod
+    def _require_utc(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError(
+                "timestamps must be UTC with an explicit offset, e.g. 2026-11-22T10:00:00Z"
+            )
+        return value.astimezone(timezone.utc)
+
+    @field_validator("end")
+    @classmethod
+    def _require_half_open(cls, value: datetime, info) -> datetime:
+        start = info.data.get("start")
+        if start is not None and value <= start:
+            raise ValueError("end must be strictly after start")
+        return value
+
+
+class AttributionRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
+            "example": {
+                "records": [
+                    {
+                        "destination": "203.0.113.10",
+                        "start": "2026-11-22T10:00:00Z",
+                        "end": "2026-11-22T10:05:00Z",
+                        "bytes": 1048576,
+                    },
+                    {
+                        "destination": "198.51.100.10",
+                        "start": "2026-11-22T10:00:00Z",
+                        "end": "2026-11-22T10:05:00Z",
+                        "bytes": 524288,
+                    },
+                ]
+            }
+        }
+    )
+
+    records: list[AttributionRecordRequest] = Field(
+        min_length=1,
+        max_length=1000,
+        description="Traffic records evaluated against the history snapshot taken "
+        "when the report starts. Intervals are half-open: start inclusive, end exclusive.",
     )
 
 
@@ -324,6 +402,44 @@ class LookupResponse(ResponseModel):
     found_count: int
     not_found_count: int
     matches: list[MatchView]
+
+
+class AttributionOutcome(str, Enum):
+    attributed = "attributed"
+    no_route = "no_route"
+    changed_route = "changed_route"
+    insufficient_history = "insufficient_history"
+
+
+class AttributionRecordView(ResponseModel):
+    index: int
+    destination: IPv4Address
+    start: datetime
+    end: datetime
+    bytes: int
+    outcome: AttributionOutcome
+    neighbor: IPv4Address | None = None
+    next_hop: IPv4Address | None = None
+    prefix: IPv4Network | None = None
+    first_change_at: datetime | None = None
+
+
+class NeighborByteTotal(ResponseModel):
+    neighbor: IPv4Address
+    bytes: int
+
+
+class AttributionResponse(ResponseModel):
+    revision: int
+    computed_at: datetime
+    history_horizon: datetime | None
+    history_retention_seconds: float
+    attributed_count: int
+    no_route_count: int
+    changed_route_count: int
+    insufficient_history_count: int
+    neighbor_totals: list[NeighborByteTotal]
+    records: list[AttributionRecordView]
 
 
 class RouteView(ResponseModel):

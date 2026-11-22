@@ -15,6 +15,9 @@ from .models import (
     AnnouncementEvent,
     AnnouncementRequest,
     AnnouncementResponse,
+    AttributionRecordView,
+    AttributionRequest,
+    AttributionResponse,
     EndOfRibEvent,
     EndOfRibRequest,
     EndOfRibResponse,
@@ -25,6 +28,7 @@ from .models import (
     LookupRequest,
     LookupResponse,
     MatchView,
+    NeighborByteTotal,
     NeighborView,
     NeighborsResponse,
     ReconnectEvent,
@@ -148,6 +152,7 @@ def create_app(
         neighbor_priorities=settings.neighbor_priorities,
         default_neighbor_priority=settings.default_neighbor_priority,
         grace_period_seconds=settings.grace_seconds,
+        history_retention_seconds=settings.history_retention_seconds,
     )
 
     @asynccontextmanager
@@ -169,6 +174,10 @@ def create_app(
         openapi_tags=[
             {"name": "events", "description": "Collector events, single or batched."},
             {"name": "lookup", "description": "Batch destination lookup."},
+            {
+                "name": "attribution",
+                "description": "Batch traffic attribution from routing history.",
+            },
             {"name": "admin", "description": "Table inspection and demo reset."},
         ],
     )
@@ -356,6 +365,73 @@ def create_app(
             found_count=found,
             not_found_count=len(matches) - found,
             matches=matches,
+        )
+
+    # ------------------------------------------------------------ attribution
+    @app.post(
+        "/v1/attribution/report",
+        response_model=AttributionResponse,
+        tags=["attribution"],
+        summary="Attribute a batch of traffic records from routing history",
+        description=(
+            "Each record carries a destination IPv4, a half-open UTC interval "
+            "`[start, end)` and a byte count. The whole batch is evaluated "
+            "against the history snapshot taken when the report starts, so "
+            "route updates received while the report runs do not change the "
+            "result. A record is attributed to one neighbour only when that "
+            "neighbour is selected for the entire interval; records with no "
+            "route at all, a route change mid-interval (including a change that "
+            "later returns to the first neighbour), or history that does not "
+            "cover the full interval are listed separately. `first_change_at` "
+            "gives the first instant the selected neighbour changed."
+        ),
+    )
+    async def attribution_report(body: AttributionRequest) -> AttributionResponse:
+        report = service.attribution_report(
+            [
+                (record.destination, record.start, record.end, record.bytes)
+                for record in body.records
+            ]
+        )
+        views = [
+            AttributionRecordView(
+                index=record.index,
+                destination=record.destination,
+                start=record.start,
+                end=record.end,
+                bytes=record.bytes,
+                outcome=record.outcome,
+                neighbor=record.neighbor,
+                next_hop=record.next_hop,
+                prefix=record.prefix,
+                first_change_at=record.first_change_at,
+            )
+            for record in report.records
+        ]
+        counts = {
+            "attributed": 0,
+            "no_route": 0,
+            "changed_route": 0,
+            "insufficient_history": 0,
+        }
+        for record in views:
+            counts[record.outcome.value] += 1
+        return AttributionResponse(
+            revision=report.revision,
+            computed_at=report.computed_at,
+            history_horizon=report.history_horizon,
+            history_retention_seconds=report.retention_seconds,
+            attributed_count=counts["attributed"],
+            no_route_count=counts["no_route"],
+            changed_route_count=counts["changed_route"],
+            insufficient_history_count=counts["insufficient_history"],
+            neighbor_totals=[
+                NeighborByteTotal(neighbor=neighbor, bytes=byte_total)
+                for neighbor, byte_total in sorted(
+                    report.neighbor_totals.items(), key=lambda item: int(item[0])
+                )
+            ],
+            records=views,
         )
 
     # ----------------------------------------------------------------- admin
